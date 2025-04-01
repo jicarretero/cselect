@@ -11,11 +11,25 @@
 #include <fcntl.h>
 #include <errno.h>
 
-
+/*
+* 3  - 0=stdin, 1=stdout, 2=stderr, 3 socket accepting connections
+*/
+#define MIN_SOCKET_FD   3 
+#define LISTEN_BACKLOG   10
 #define MAX_BUFFER 4096
 #define SERVER_PORT 4141
 #define MAX_SELECTOR 1024
+#define LOCAL_BUFFERS 1024
 
+#define MAX(a,b) a>=b?a:b
+#define TMAX(a,b,c) MAX(MAX(a,b),c)
+
+int fds [LOCAL_BUFFERS] = {0};
+char *remote_ip = NULL;
+int remote_port;
+int server_port;
+
+int max_fd = 2;
 
 void print_usage(const char *program_name) {
     fprintf(stderr, "Usage: %s <remote_ip> <remote_port> [<local_port>]\n", program_name);
@@ -54,7 +68,7 @@ int new_server(const int port) {
     }
 
     // Listen for incoming connections
-    if (listen(server_fd, 3) < 0) {
+    if (listen(server_fd, LISTEN_BACKLOG) < 0) {
         perror("Listen failed");
         exit(EXIT_FAILURE);
     }
@@ -138,7 +152,7 @@ int connect_with_timeout(const char * host, const int port) {
     tv.tv_sec = timeout_sec;
     tv.tv_usec = 0;
 
-    rc = select(1024, NULL, &fdset, NULL, &tv);
+    rc = select(MAX_SELECTOR, NULL, &fdset, NULL, &tv);
     if (rc <= 0) {
         fprintf(stderr, ".... TIMEOUT connecting %s:%d\n", host, port);
         close(sockfd);
@@ -182,67 +196,93 @@ void write_that(const char * who, int n_bytes, const char * buffer) {
     fsync(STDOUT_FILENO);  // Ensure data is flushed to terminal
 }
 
-void talk(int remote_fd, int client_fd) {
+void close_both(int peer1) {
+  int peer2 = fds[peer1];
+  close(peer1);
+  close(peer2);
+  fds[peer1] = 0;
+  fds[peer2] = 0;
+  while (fds[max_fd] == 0 && max_fd>3) {
+    max_fd--;
+  }
+  fprintf(stderr, "Closed %d, %d -> max=%d\n",peer1, peer2, max_fd);
+}
+
+void talk(int listen_fd) {
     fd_set readfds;
     char buffer[MAX_BUFFER] = {0};
 
+    max_fd = listen_fd;
+
     while (1) {
         FD_ZERO(&readfds);
-        FD_SET(remote_fd, &readfds);  // Add server socket to watch for new connections
-        FD_SET(client_fd, &readfds);  // Add remote connection
+        FD_SET(listen_fd, &readfds);
+        
+        for (int i=MIN_SOCKET_FD; i<=max_fd; i++) {
+          if (i == listen_fd || fds[i] == 0)
+            continue;
+           FD_SET(i, &readfds);
+        }
 
-        // Wait for activity on any socket
+        
         int activity = select(MAX_SELECTOR, &readfds, NULL, NULL, NULL);
         if ((activity < 0) && (errno != EINTR)) {
             perror("Select error");
         }
 
-        // Handle data from client
-        if (FD_ISSET(client_fd, &readfds)) {
-            int n_read = read(client_fd, buffer, MAX_BUFFER);
-            if (n_read == 0) {
-                // Client disconnected
-                fprintf(stderr, "Client disconnected\n");
-                break;
-            } else if (n_read > 0) {
-                write_that("CLIENT", n_read, buffer);
-                // Forward to remote server
-                send(remote_fd, buffer, n_read, 0);
-                memset(buffer, 0, MAX_BUFFER);
+        if (FD_ISSET(listen_fd, &readfds)) {
+          int client_fd = accept_connection(listen_fd);
+          int remote_fd = -1;
+          if (client_fd >= MAX_SELECTOR) {
+              close(client_fd);
+              client_fd = -1;
+          }
+          if (client_fd >0) {
+            remote_fd = connect_with_timeout(remote_ip, remote_port);
+            if (remote_fd>0) {
+              fds[remote_fd] = client_fd;
+              fds[client_fd] = remote_fd;
+              max_fd = TMAX(max_fd, client_fd, remote_fd);
+              fprintf(stderr, "Connected to remote server at %s:%d  (l=%d,r=%d) - %d\n", remote_ip, remote_port, client_fd, remote_fd, max_fd);
+            } else {
+              close(client_fd);
             }
+          }
         }
+        
+        for (int i=MIN_SOCKET_FD; i<max_fd; i++) {
+          if (i == listen_fd || fds[i] == 0)
+            continue;
 
-        // Handle data from remote server
-        if (FD_ISSET(remote_fd, &readfds)) {
-            int n_read = read(remote_fd, buffer, MAX_BUFFER);
-            if (n_read == 0) {
-                // Remote server disconnected
-                fprintf(stderr, "Remote server disconnected\n");
-                break;
-            } else if (n_read > 0) {
-                write_that("REMOTE", n_read, buffer);
-                // Forward to client if connected
-                if (client_fd > 0) {
-                    send(client_fd, buffer, n_read, 0);
-                }
-                memset(buffer, 0, MAX_BUFFER);
-            }
+          if (FD_ISSET(i, &readfds)) {
+              int n_read = read(i, buffer, MAX_BUFFER);
+              if (n_read == 0) {
+                  fprintf(stderr, "disconnected\n");
+                  close_both(i);
+                  break;
+              } else if (n_read > 0) {
+                  char s[LOCAL_BUFFERS];
+                  snprintf(s, LOCAL_BUFFERS, "-- PEER (%d -> %d)--", i, fds[i]);
+                  write_that(s, n_read, buffer);
+                  // Forward to remote server
+                  send(fds[i], buffer, n_read, 0);
+                  memset(buffer, 0, MAX_BUFFER);
+              }
+          }
         }
     }
-    close(remote_fd);
-    close(client_fd);
 }
 
 int main(int argc, char * argv[]) {
-    int server_fd=-1, client_fd=-1, remote_fd=-1;
+    int server_fd=-1;
 
     if (argc!=3 && argc !=4) {
         print_usage(argv[0]);
     }
 
-    const char *remote_ip = argv[1];
-    int remote_port = atoi(argv[2]);
-    int server_port = argc==4 ? atoi(argv[3]) : SERVER_PORT;
+    remote_ip = argv[1];
+    remote_port = atoi(argv[2]);
+    server_port = argc==4 ? atoi(argv[3]) : SERVER_PORT;
 
     printf("Local port: %d ; Remoter_server: %s:%d\n", server_port, remote_ip, remote_port);
     if (server_port <=0 || remote_port<=0) {
@@ -251,24 +291,8 @@ int main(int argc, char * argv[]) {
 
     server_fd = new_server(server_port);
 
-    while (1) {
-        client_fd = accept_connection(server_fd);
-        if (client_fd>0) {
-          remote_fd = connect_with_timeout(remote_ip, remote_port);
-          if (remote_fd>0) {
-              fprintf(stderr, "Connected to remote server at %s:%d\n", remote_ip, remote_port);
-              talk(remote_fd, client_fd);
-          } else {
-              close(client_fd);
-              client_fd = -1;
-          }
-        }
-    }
+    talk(server_fd);
 
     close(server_fd);
-    close(remote_fd);
-    if (client_fd > 0) {
-        close(client_fd);
-    }
     return 0;
 }
