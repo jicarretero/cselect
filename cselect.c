@@ -25,19 +25,28 @@
 #define TMAX(a,b,c) MAX(MAX(a,b),c)
 
 int fds [LOCAL_BUFFERS] = {0};
-char *remote_ip = NULL;
+char remote_ip[LOCAL_BUFFERS] = {0};
+char send_ip[LOCAL_BUFFERS] = {0};
 int remote_port;
 int server_port;
+int send_port;
 
 int max_fd = 2;
 
+typedef struct  {
+  int32_t from_fd;
+  int32_t to_fd;
+  int32_t nbytes;
+  char buffer[MAX_BUFFER];
+} rmt_transfer;
+
+
 void print_usage(const char *program_name) {
-    fprintf(stderr, "Usage: %s <remote_ip> <remote_port> [<local_port>]\n", program_name);
+    fprintf(stderr, "Usage: %s -l <remote_ip>:<remote_port> [-p <local_port>] [-s <send_ip>:<send_port>]\n", program_name);
     fprintf(stderr, "   by default local_port is 4141\n\n");
-    fprintf(stderr, "Example: %s 127.0.0.1 8081 4141\n", program_name);
+    fprintf(stderr, "Example: %s -l 127.0.0.1:8081 -p 4141 -s localhost:51966\n", program_name);
     exit(EXIT_FAILURE);
 }
-
 
 int new_server(const int port) {
     int server_fd = -1;
@@ -73,7 +82,7 @@ int new_server(const int port) {
         exit(EXIT_FAILURE);
     }
 
-    fprintf(stderr, "Server listening on port %d...\n", SERVER_PORT);
+    fprintf(stderr, "Server listening on port %d...\n", server_port);
     return server_fd;
 }
 
@@ -273,16 +282,42 @@ void talk(int listen_fd) {
     }
 }
 
-int main(int argc, char * argv[]) {
-    int server_fd=-1;
 
-    if (argc!=3 && argc !=4) {
-        print_usage(argv[0]);
+
+int t_main(int argc, char * argv[]) {
+    int c;
+    char *cvalue = NULL;
+    server_port = -1;
+    int cflag = 0;
+
+    while ((c = getopt (argc, argv, "r:p:c:")) != -1) {
+        switch (c) {
+            case 'r':
+              /* Remote connection - Host:port to connect to for every connection */
+              sscanf(optarg ,"%1024[^:]:%5d", remote_ip, &remote_port);
+              printf(".... leido r: [%s] [%d]\n", remote_ip, remote_port);
+              cflag = 1;
+              break;
+            case 'p':
+              /* port - This program listens this port*/
+              sscanf(optarg, "%d", &server_port);
+              printf(".... leido p: [%d]\n", server_port);
+            case 's':
+              /* Send data to host:port*/
+              sscanf(optarg, "%1024s[^:]:%d", send_ip, &send_port);
+              break;
+        }
     }
 
-    remote_ip = argv[1];
-    remote_port = atoi(argv[2]);
-    server_port = argc==4 ? atoi(argv[3]) : SERVER_PORT;
+    server_port == -1 ? SERVER_PORT : server_port;
+
+    if (!cflag)
+        print_usage(argv[0]);
+}
+
+int main(int argc, char * argv[]) {
+    t_main(argc, argv);
+    int server_fd=-1;
 
     printf("Local port: %d ; Remoter_server: %s:%d\n", server_port, remote_ip, remote_port);
     if (server_port <=0 || remote_port<=0) {
