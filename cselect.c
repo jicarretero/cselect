@@ -30,7 +30,7 @@ char send_ip[LOCAL_BUFFERS] = {0};
 int remote_port;
 int server_port;
 int send_port;
-
+int send_fd=-1;
 int max_fd = 2;
 
 typedef struct  {
@@ -42,9 +42,9 @@ typedef struct  {
 
 
 void print_usage(const char *program_name) {
-    fprintf(stderr, "Usage: %s -l <remote_ip>:<remote_port> [-p <local_port>] [-s <send_ip>:<send_port>]\n", program_name);
+    fprintf(stderr, "Usage: %s -r <remote_ip>:<remote_port> [-p <local_port>] [-s <send_ip>:<send_port>]\n", program_name);
     fprintf(stderr, "   by default local_port is 4141\n\n");
-    fprintf(stderr, "Example: %s -l 127.0.0.1:8081 -p 4141 -s localhost:51966\n", program_name);
+    fprintf(stderr, "Example: %s -r 127.0.0.1:8081 -p 4141\n", program_name);
     exit(EXIT_FAILURE);
 }
 
@@ -197,12 +197,17 @@ int accept_connection(int server_fd) {
     return client_fd;
 }
 
-void write_that(const char * who, int n_bytes, const char * buffer) {
+void write_that(const char * who, int peer, int n_bytes, const char * buffer) {
     char who_str[MAX_BUFFER];
     snprintf(who_str, MAX_BUFFER, "-------------- [%s] ---------------\n", who);
     write(STDOUT_FILENO, who_str, strlen(who_str));
     write(STDOUT_FILENO, buffer, n_bytes);
     fsync(STDOUT_FILENO);  // Ensure data is flushed to terminal
+    
+    if (send_fd > 0) {
+      rmt_transfer tr = {peer, fds[peer], n_bytes};
+      memcpy(tr.buffer, buffer, n_bytes);
+    }
 }
 
 void close_both(int peer1) {
@@ -211,7 +216,7 @@ void close_both(int peer1) {
   close(peer2);
   fds[peer1] = 0;
   fds[peer2] = 0;
-  while (fds[max_fd] == 0 && max_fd>3) {
+  while (fds[max_fd] == 0 && max_fd>MIN_SOCKET_FD) {
     max_fd--;
   }
   fprintf(stderr, "Closed %d, %d -> max=%d\n",peer1, peer2, max_fd);
@@ -272,7 +277,7 @@ void talk(int listen_fd) {
               } else if (n_read > 0) {
                   char s[LOCAL_BUFFERS];
                   snprintf(s, LOCAL_BUFFERS, "-- PEER (%d -> %d)--", i, fds[i]);
-                  write_that(s, n_read, buffer);
+                  write_that(s, i, n_read, buffer);
                   // Forward to remote server
                   send(fds[i], buffer, n_read, 0);
                   memset(buffer, 0, MAX_BUFFER);
@@ -287,7 +292,7 @@ void talk(int listen_fd) {
 int t_main(int argc, char * argv[]) {
     int c;
     char *cvalue = NULL;
-    server_port = -1;
+    server_port = SERVER_PORT;
     int cflag = 0;
 
     while ((c = getopt (argc, argv, "r:p:c:")) != -1) {
@@ -295,22 +300,18 @@ int t_main(int argc, char * argv[]) {
             case 'r':
               /* Remote connection - Host:port to connect to for every connection */
               sscanf(optarg ,"%1024[^:]:%5d", remote_ip, &remote_port);
-              printf(".... leido r: [%s] [%d]\n", remote_ip, remote_port);
               cflag = 1;
               break;
             case 'p':
               /* port - This program listens this port*/
               sscanf(optarg, "%d", &server_port);
-              printf(".... leido p: [%d]\n", server_port);
             case 's':
               /* Send data to host:port*/
               sscanf(optarg, "%1024s[^:]:%d", send_ip, &send_port);
+              send_fd = 0;
               break;
         }
     }
-
-    server_port == -1 ? SERVER_PORT : server_port;
-
     if (!cflag)
         print_usage(argv[0]);
 }
@@ -320,11 +321,21 @@ int main(int argc, char * argv[]) {
     int server_fd=-1;
 
     printf("Local port: %d ; Remoter_server: %s:%d\n", server_port, remote_ip, remote_port);
+
     if (server_port <=0 || remote_port<=0) {
         print_usage(argv[0]);
     }
 
     server_fd = new_server(server_port);
+
+    if (send_fd == 0) {
+      printf("%s %d\n", send_ip, send_port);
+      send_fd = connect_with_timeout(send_ip, send_port);
+      if (send_fd > 0) {
+          fds[send_fd] = send_fd;
+          max_fd = MAX(max_fd, send_fd);
+      }
+    }
 
     talk(server_fd);
 
